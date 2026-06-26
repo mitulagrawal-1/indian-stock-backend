@@ -63,20 +63,18 @@ async def analyze_sector(payload: SectorRequest):
     query_string = SECTOR_QUERIES[name]
     
     try:
-        # 1. Fetch Indian Market Data via yfinance
+        # 1. Fetch Indian Market Data via yfinance (Resilient to weekends and holidays)
         ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="2d")
+        # Pull a full month of data to guarantee rows are returned during weekends
+        hist = ticker.history(period="1mo")
         
         if len(hist) < 2:
-            raise HTTPException(status_code=500, detail="Insufficient market data returned from yfinance.")
+            raise HTTPException(status_code=500, detail=f"Insufficient market data returned from yfinance for symbol {ticker_symbol}.")
             
-        close_price = round(hist['Close'].iloc[-1], 2)
-        prev_close = hist['Close'].iloc[-2]
+        recent_days = hist.tail(2)
+        close_price = round(recent_days['Close'].iloc[-1], 2)
+        prev_close = recent_days['Close'].iloc[-2]
         pct_change = round(((close_price - prev_close) / prev_close) * 100, 2)
-        
-        # 2. Scrape Live Indian Financial News via Google News RSS Feed
-        rss_url = f"https://news.google.com/rss/search?q={query_string}&hl=en-IN&gl=IN&ceid=IN:en"
-        headlines = []
         
         async with httpx.AsyncClient() as client:
             rss_response = await client.get(rss_url)
