@@ -1,6 +1,7 @@
 import os
 import asyncio
 import xml.etree.ElementTree as ET
+from datetime import date, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,7 +11,6 @@ from supabase import create_client, Client
 
 app = FastAPI(title="Indian Stock Sector Sentiment API")
 
-# Enable CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +19,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration from Environment
+def get_last_trading_day() -> date:
+    today = date.today()
+    # Monday=0, Sunday=6
+    if today.weekday() == 5:  # Saturday
+        return today - timedelta(days=1)
+    elif today.weekday() == 6:  # Sunday
+        return today - timedelta(days=2)
+    else:  # Weekday, get previous day
+        return today - timedelta(days=1)
+
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL")
@@ -47,10 +57,6 @@ SECTOR_QUERIES = {
     "FMCG": "Nifty FMCG OR ITC share OR Hindustan Unilever news"
 }
 
-@app.get("/health")
-def health_check():
-    return {"status": "alive"}
-
 @app.post("/api/analyze-sector")
 async def analyze_sector(payload: SectorRequest):
     # Ensure database is configured
@@ -64,19 +70,29 @@ async def analyze_sector(payload: SectorRequest):
     ticker_symbol = SECTOR_TICKERS[name]
     query_string = SECTOR_QUERIES[name]
     
-    # Initialize variables for safe scope
+    # Initialize all variables at the very top of the function scope
     close_price = 0.0
     pct_change = 0.0
     headlines = []
     avg_sentiment = 0.0
     sentiment_label = "Neutral"
-    
+    rss_url = f"https://news.google.com/rss/search?q={query_string}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    fetch_date = get_last_trading_day()
+    print(f"DEBUG: Fetching data for {fetch_date.isoformat()}")
+
     try:
-        # 1. Fetch Indian Market Data via yfinance with Fallback
+        print(f"DEBUG: Starting pipeline for {name}")
+
+        # 1. Fetch Indian Market Data
         ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="1mo")
-        
+
+        # Fetch enough history to ensure we get the last trading day and its previous trading day
+        # Max period of 5 days should cover most weekend/holiday scenarios
+        hist = ticker.history(start=fetch_date - timedelta(days=5), end=fetch_date + timedelta(days=1))
+
         if hist.empty or len(hist) < 2:
+            print(f"DEBUG: Using fallback data for {ticker_symbol} due to insufficient history")
             fallback_data = {
                 "^NSEBANK": {"close": 52450.35, "change": 0.85},
                 "^CNXIT": {"close": 41820.10, "change": -0.62},
@@ -87,15 +103,29 @@ async def analyze_sector(payload: SectorRequest):
             defaults = fallback_data.get(ticker_symbol, {"close": 25000.0, "change": 0.0})
             close_price, pct_change = defaults["close"], defaults["change"]
         else:
-            recent_days = hist.tail(2)
-            close_price = round(recent_days['Close'].iloc[-1], 2)
-            prev_close = recent_days['Close'].iloc[-2]
-            pct_change = round(((close_price - prev_close) / prev_close) * 100, 2)
+            # Filter for the actual fetch_date and its immediate preceding trading day
+            actual_trading_days = hist[hist.index <= str(fetch_date)].tail(2)
+
+            if len(actual_trading_days) < 2:
+                print(f"DEBUG: Using fallback data for {ticker_symbol} as only one or no trading day found around {fetch_date}")
+                fallback_data = {
+                    "^NSEBANK": {"close": 52450.35, "change": 0.85},
+                    "^CNXIT": {"close": 41820.10, "change": -0.62},
+                    "^CNXAUTO": {"close": 25110.80, "change": 1.45},
+                    "^CNXPHARMA": {"close": 20340.25, "change": -0.18},
+                    "^CNXFMCG": {"close": 57890.40, "change": 0.35}
+                }
+                defaults = fallback_data.get(ticker_symbol, {"close": 25000.0, "change": 0.0})
+                close_price, pct_change = defaults["close"], defaults["change"]
+            else:
+                close_price = round(actual_trading_days['Close'].iloc[-1], 2)
+                prev_close = actual_trading_days['Close'].iloc[-2]
+                pct_change = round(((close_price - prev_close) / prev_close) * 100, 2)
             
         # 2. Scrape News
-        rss_url = f"https://news.google.com/rss/search?q={query_string}&hl=en-IN&gl=IN&ceid=IN:en"
+        print(f"DEBUG: Fetching news from {rss_url}")
         async with httpx.AsyncClient() as client:
-            rss_response = await client.get(rss_url)
+            rss_response = await client.get(rss_url, timeout=10.0)
             if rss_response.status_code == 200:
                 root = ET.fromstring(rss_response.content)
                 for item in root.findall('.//item')[:5]:
@@ -107,8 +137,9 @@ async def analyze_sector(payload: SectorRequest):
         if not headlines:
             headlines = [f"Tracking general indices for the Indian {name} sector."]
 
-        # 3. Sentiment Analysis via HF Space
+        # 3. Sentiment Analysis
         if HF_SPACE_URL and headlines:
+            print("DEBUG: Sending to HF Space")
             async with httpx.AsyncClient() as client:
                 tasks = [client.post(f"{HF_SPACE_URL.rstrip('/')}/analyze", json={"text": t}, timeout=15.0) for t in headlines]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -128,6 +159,7 @@ async def analyze_sector(payload: SectorRequest):
                     elif avg_sentiment < -0.15: sentiment_label = "Negative"
 
         # 4. Save to Supabase
+        print("DEBUG: Saving to Supabase")
         data_to_insert = {
             "sector_name": name, "ticker": ticker_symbol, "close_price": close_price,
             "pct_change": pct_change, "avg_sentiment_score": avg_sentiment,
@@ -138,4 +170,5 @@ async def analyze_sector(payload: SectorRequest):
         return {"status": "success", "data": data_to_insert}
         
     except Exception as e:
+        print(f"DEBUG: CRITICAL ERROR - {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
