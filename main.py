@@ -92,32 +92,13 @@ async def analyze_sector(payload: SectorRequest):
         hist = ticker.history(start=fetch_date - timedelta(days=5), end=fetch_date + timedelta(days=1))
 
         if hist.empty or len(hist) < 2:
-            print(f"DEBUG: Using fallback data for {ticker_symbol} due to insufficient history")
-            fallback_data = {
-                "^NSEBANK": {"close": 52450.35, "change": 0.85},
-                "^CNXIT": {"close": 41820.10, "change": -0.62},
-                "^CNXAUTO": {"close": 25110.80, "change": 1.45},
-                "^CNXPHARMA": {"close": 20340.25, "change": -0.18},
-                "^CNXFMCG": {"close": 57890.40, "change": 0.35}
-            }
-            defaults = fallback_data.get(ticker_symbol, {"close": 25000.0, "change": 0.0})
-            close_price, pct_change = defaults["close"], defaults["change"]
+            raise HTTPException(status_code=500, detail=f"Insufficient historical data for {ticker_symbol} around {fetch_date.isoformat()}")
         else:
             # Filter for the actual fetch_date and its immediate preceding trading day
             actual_trading_days = hist[hist.index <= str(fetch_date)].tail(2)
 
             if len(actual_trading_days) < 2:
-                print(f"DEBUG: Using fallback data for {ticker_symbol} as only one or no trading day found around {fetch_date}")
-                fallback_data = {
-                    "^NSEBANK": {"close": 52450.35, "change": 0.85},
-                    "^CNXIT": {"close": 41820.10, "change": -0.62},
-                    "^CNXAUTO": {"close": 25110.80, "change": 1.45},
-                    "^CNXPHARMA": {"close": 20340.25, "change": -0.18},
-                    "^CNXFMCG": {"close": 57890.40, "change": 0.35}
-                }
-                defaults = fallback_data.get(ticker_symbol, {"close": 25000.0, "change": 0.0})
-                close_price, pct_change = defaults["close"], defaults["change"]
-            else:
+                raise HTTPException(status_code=500, detail=f"Insufficient historical data for {ticker_symbol} after filtering around {fetch_date.isoformat()}")            else:
                 close_price = round(actual_trading_days['Close'].iloc[-1], 2)
                 prev_close = actual_trading_days['Close'].iloc[-2]
                 pct_change = round(((close_price - prev_close) / prev_close) * 100, 2)
